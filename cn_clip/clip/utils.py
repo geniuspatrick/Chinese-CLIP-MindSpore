@@ -4,16 +4,24 @@ import json
 import os
 from pathlib import Path
 from typing import Union, List
-import urllib
-
-import torch
-from torchvision.transforms import Compose, ToTensor, Normalize, Resize, InterpolationMode
+import urllib.request
 from tqdm import tqdm
+import numpy as np
 
-from cn_clip.clip import _tokenizer
-from cn_clip.clip.model import convert_weights, CLIP, restore_model
+import mindspore as ms
+from mindspore import nn
+from mindspore.dataset.transforms import Compose
+from mindspore.dataset.vision import ToTensor, Normalize, Resize, Inter
 
-__all__ = ["load", "tokenize", "available_models", "image_transform", "load_from_name"]
+from . import _tokenizer
+from .model import CLIP, convert_weights, restore_model
+
+__all__ = [
+    "tokenize",
+    "available_models",
+    "image_transform",
+    "load_from_name",
+]
 
 _MODELS = {
     "ViT-B-16": "https://clip-cn-beijing.oss-cn-beijing.aliyuncs.com/checkpoints/clip_cn_vit-b-16.pt",
@@ -55,7 +63,7 @@ def _download(url: str, root: str):
     if os.path.exists(download_target) and not os.path.isfile(download_target):
         raise RuntimeError(f"{download_target} exists and is not a regular file")
 
-    if os.path.isfile(download_target):
+    if os.path.isfile(download_target) or os.path.isfile(download_target.replace(".pt", ".npy")) or os.path.isfile(download_target.replace(".pt", ".ckpt")):
         return download_target
 
     with urllib.request.urlopen(url) as source, open(download_target, "wb") as output:
@@ -81,8 +89,7 @@ def available_models() -> List[str]:
     return list(_MODELS.keys())
 
 
-def load_from_name(name: str, device: Union[str, torch.device] = "cuda" if torch.cuda.is_available() else "cpu",
-                   download_root: str = None, vision_model_name: str = None, text_model_name: str = None, input_resolution: int = None):
+def load_from_name(name: str, download_root: str = None, vision_model_name: str = None, text_model_name: str = None, input_resolution: int = None):
     if name in _MODELS:
         model_path = _download(_MODELS[name], download_root or os.path.expanduser("~/.cache/clip"))
         model_name, model_input_resolution = _MODEL_INFO[name]['struct'], _MODEL_INFO[name]['input_resolution']
@@ -93,34 +100,11 @@ def load_from_name(name: str, device: Union[str, torch.device] = "cuda" if torch
     else:
         raise RuntimeError(f"Model {name} not found; available models = {available_models()}")
 
-    with open(model_path, 'rb') as opened_file:
-        # loading saved checkpoint
-        checkpoint = torch.load(opened_file, map_location="cpu")
-
-    model = create_model(model_name, checkpoint)
-    if str(device) == "cpu":
-        model.float()
-    else:
-        model.to(device)
+    model = create_model(model_name, model_path)
     return model, image_transform(model_input_resolution)
 
 
-def load(model, device: Union[str, torch.device] = "cuda" if torch.cuda.is_available() else "cpu", clip_path=None,
-         bert_path=None, use_flash_attention=False):
-    """Load CLIP and BERT model weights
-    """
-
-    bert_state_dict = torch.load(bert_path, map_location="cpu") if bert_path else None
-    clip_state_dict = torch.load(clip_path, map_location="cpu") if clip_path else None
-
-    restore_model(model, clip_state_dict, bert_state_dict, use_flash_attention).to(device)
-
-    if str(device) == "cpu":
-        model.float()
-    return model
-
-
-def tokenize(texts: Union[str, List[str]], context_length: int = 52) -> torch.LongTensor:
+def tokenize(texts: Union[str, List[str]], context_length: int = 52):
     """
     Returns the tokenized representation of given input string(s)
     Parameters
@@ -141,11 +125,11 @@ def tokenize(texts: Union[str, List[str]], context_length: int = 52) -> torch.Lo
         all_tokens.append([_tokenizer.vocab['[CLS]']] + _tokenizer.convert_tokens_to_ids(_tokenizer.tokenize(text))[
                                                         :context_length - 2] + [_tokenizer.vocab['[SEP]']])
 
-    result = torch.zeros(len(all_tokens), context_length, dtype=torch.long)
+    result = np.zeros((len(all_tokens), context_length), dtype=np.int64)
 
     for i, tokens in enumerate(all_tokens):
         assert len(tokens) <= context_length
-        result[i, :len(tokens)] = torch.tensor(tokens)
+        result[i, :len(tokens)] = np.array(tokens)
 
     return result
 
@@ -156,15 +140,15 @@ def _convert_to_rgb(image):
 
 def image_transform(image_size=224):
     transform = Compose([
-        Resize((image_size, image_size), interpolation=InterpolationMode.BICUBIC),
+        Resize((image_size, image_size), interpolation=Inter.BICUBIC),
         _convert_to_rgb,
         ToTensor(),
-        Normalize((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711)),
+        Normalize((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711), is_hwc=False),
     ])
     return transform
 
 
-def create_model(model_name, checkpoint=None):
+def create_model(model_name, checkpoint_file=None):
     vision_model, text_model = model_name.split('@')
     # Initialize the model.
     vision_model_config_file = Path(
@@ -185,10 +169,67 @@ def create_model(model_name, checkpoint=None):
         model_info['vision_layers'] = eval(model_info['vision_layers'])
     print('Model info', model_info)
     model = CLIP(**model_info)
-    convert_weights(model)
-    if checkpoint:
-        sd = checkpoint["state_dict"]
-        if next(iter(sd.items()))[0].startswith('module'):
-            sd = {k[len('module.'):]: v for k, v in sd.items() if "bert.pooler" not in k}
-        model.load_state_dict(sd)
+    # convert_weights(model)
+    if checkpoint_file:
+        def refiner(sd):
+            if next(iter(sd.items()))[0].startswith('module'):
+                sd = {k[len('module.'):]: v for k, v in sd.items() if "bert.pooler" not in k}
+            return sd
+        load_pt_weights_in_model(model, checkpoint_file, (refiner,))
+
     return model
+
+
+def get_pt2ms_mappings(model):
+    mappings = {}  # pt_param_name: (ms_param_name, pt_param_to_ms_param_func)
+    for name, cell in model.cells_and_names():
+        if isinstance(cell, nn.Conv1d):
+            mappings[f"{name}.weight"] = f"{name}.weight", lambda x: np.expand_dims(x, axis=-2)
+        elif isinstance(cell, nn.Embedding):
+            mappings[f"{name}.weight"] = f"{name}.embedding_table", lambda x: x
+        elif isinstance(cell, (nn.BatchNorm2d, nn.LayerNorm, nn.GroupNorm)):
+            mappings[f"{name}.weight"] = f"{name}.gamma", lambda x: x
+            mappings[f"{name}.bias"] = f"{name}.beta", lambda x: x
+            if isinstance(cell, (nn.BatchNorm2d,)):
+                mappings[f"{name}.running_mean"] = f"{name}.moving_mean", lambda x: x
+                mappings[f"{name}.running_var"] = f"{name}.moving_variance", lambda x: x
+                mappings[f"{name}.num_batches_tracked"] = None, lambda x: x
+    return mappings
+
+
+def convert_state_dict(model, state_dict_pt):
+    mappings = get_pt2ms_mappings(model)
+    state_dict_ms = {}
+    for name_pt, data_pt in state_dict_pt.items():
+        name_ms, data_mapping = mappings.get(name_pt, (name_pt, lambda x: x))
+        data_ms = data_mapping(data_pt)
+        if name_ms is not None:
+            state_dict_ms[name_ms] = ms.Parameter(data_ms.astype(np.float32), name=name_ms)
+    return state_dict_ms
+
+
+def load_pt_weights_in_model(model, checkpoint_file_pt, state_dict_refiners=None):
+    checkpoint_file_ms = f"{os.path.splitext(checkpoint_file_pt)[0]}.ckpt"
+    if not os.path.exists(checkpoint_file_ms):  # try to load weights from intermediary numpy file.
+        checkpoint_file_np = f"{os.path.splitext(checkpoint_file_pt)[0]}.npy"
+        if not os.path.exists(checkpoint_file_np):
+            raise FileNotFoundError(f"You need to manually convert {checkpoint_file_pt} to {checkpoint_file_np}")
+        sd_original = np.load(checkpoint_file_np, allow_pickle=True).item()
+        # refine state dict of pytorch
+        sd_refined = sd_original
+        if state_dict_refiners:
+            for refine_fn in state_dict_refiners:
+                sd_refined = refine_fn(sd_refined)
+        # convert state_dict from pytorch to mindspore
+        sd = convert_state_dict(model, sd_refined)
+        # save converted state_dict as cache
+        ms.save_checkpoint([{"name": k, "data": v} for k, v in sd.items()], checkpoint_file_ms)
+    else:  # directly load weights from cached mindspore file.
+        sd = ms.load_checkpoint(checkpoint_file_ms)
+
+    param_not_load, ckpt_not_load = ms.load_param_into_net(model, sd, strict_load=True)
+    if param_not_load:
+        print(f"{param_not_load} in network is not loaded!")
+    if ckpt_not_load:
+        print(f"{ckpt_not_load} in checkpoint is not loaded!")
+
