@@ -127,6 +127,12 @@ def parse_args():
         help="Floating point precision."
     )
     parser.add_argument(
+        "--amp-opt-level",
+        choices=["O0", "O1", "O2", "O3"],
+        default="O2",
+        help="Optimization level of auto mixed precision (default: O2).",
+    )
+    parser.add_argument(
         "--vision-model",
         choices=["ViT-B-32", "ViT-B-16", "ViT-L-14", "ViT-L-14-336", "ViT-H-14", "RN50"],
         default="ViT-B-16",
@@ -142,7 +148,8 @@ def parse_args():
         "--clip-weight-path",
         default=None,
         type=str,
-        help="The path of openai pretrained weight, used to initialize the image encoder, should be set to None if you do not use pretrained CLIP",
+        help="The path of pretrained weight, used to initialize the image encoder and text encoder. "
+             "Set to None if you do not use pretrained CLIP",
     )    
     parser.add_argument(
         "--freeze-vision",
@@ -155,12 +162,6 @@ def parse_args():
         choices=["RoBERTa-wwm-ext-base-chinese", "RoBERTa-wwm-ext-large-chinese", "RBT3-chinese"],
         default="RoBERTa-wwm-ext-base-chinese",
         help="Name of the text backbone to use.",
-    )    
-    parser.add_argument(
-        "--bert-weight-path",
-        default=None,
-        type=str,
-        help="The path of bert pretrained weight, used to initialize the text encoder, should be set to None if you do not use pretrained BERT",
     )
     parser.add_argument(
         "--grad-checkpointing",
@@ -187,6 +188,7 @@ def parse_args():
         help="enable full distributed gradient for feature gather"
     )
     # arguments for distributed training
+    parser.add_argument("--distributed", default=False, action="store_true", help="Enable distributed training")
     parser.add_argument(
         "--skip-aggregate",
         default=False,
@@ -205,6 +207,7 @@ def parse_args():
         default=123, 
         help="Random seed."
     )
+    parser.add_argument("--grad-clip-norm", type=float, default=None, help="Gradient clip.")
     # arguments for distllation
     parser.add_argument(
         "--distllation",

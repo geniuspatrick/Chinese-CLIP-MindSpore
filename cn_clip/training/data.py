@@ -11,16 +11,10 @@ from dataclasses import dataclass
 import lmdb
 import pickle
 
-import numpy as np
+from mindspore.dataset import DistributedSampler, GeneratorDataset
+from mindspore.dataset.transforms import Compose
+from mindspore.dataset.vision import Resize, ToTensor, Normalize, Inter
 
-import torch
-from torch.utils.data import Dataset, DataLoader
-from torch.utils.data.distributed import DistributedSampler
-
-from torchvision.transforms import Compose, Resize, ToTensor, Normalize, InterpolationMode
-from timm.data import create_transform
-
-from cn_clip.clip import _tokenizer
 from cn_clip.clip import tokenize
 
 
@@ -34,7 +28,7 @@ def _preprocess_text(text):
     return text
 
 
-class LMDBDataset(Dataset):
+class LMDBDataset:
     def __init__(self, lmdb_path, split="val", max_txt_length=64, use_augment=False, resolution=224):
         self.lmdb_path = lmdb_path
 
@@ -56,8 +50,6 @@ class LMDBDataset(Dataset):
         self.number_images = int(self.txn_imgs.get(key=b'num_images').tobytes().decode('utf-8'))
         logging.info("{} LMDB file contains {} images and {} pairs.".format(split, self.number_images, self.number_samples))
 
-        super(LMDBDataset, self).__init__()
-
         # the self.dataset_len will be edited to a larger value by calling pad_dataset()
         self.dataset_len = self.number_samples
         self.global_batch_size = 1 # will be modified to the exact global_batch_size after calling pad_dataset()
@@ -70,23 +62,24 @@ class LMDBDataset(Dataset):
 
     def _build_transform(self, resolution):
         if self.split == "train" and self.use_augment:
-            transform = create_transform(
-                             input_size=resolution,
-                             scale=(0.9, 1.0),
-                             is_training=True,
-                             color_jitter=None,
-                             auto_augment='original',
-                             interpolation='bicubic',
-                             mean=(0.48145466, 0.4578275, 0.40821073),
-                             std=(0.26862954, 0.26130258, 0.27577711),
-                         )
-            transform = Compose(transform.transforms[:-3] + [_convert_to_rgb] + transform.transforms[-3:])
+            from mindcv import create_transforms
+            transform = create_transforms(
+                image_resize=resolution,
+                scale=(0.9, 1.0),
+                is_training=True,
+                color_jitter=None,
+                auto_augment='original',
+                interpolation='bicubic',
+                mean=(0.48145466, 0.4578275, 0.40821073),
+                std=(0.26862954, 0.26130258, 0.27577711),
+            )
+            transform = Compose(transform[:-3] + [_convert_to_rgb] + transform[-3:])
         else:
             transform = Compose([
-                Resize((resolution, resolution), interpolation=InterpolationMode.BICUBIC),
+                Resize((resolution, resolution), interpolation=Inter.BICUBIC),
                 _convert_to_rgb,
                 ToTensor(),
-                Normalize((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711)),
+                Normalize((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711), is_hwc=False),
             ])
         return transform
 
@@ -108,11 +101,11 @@ class LMDBDataset(Dataset):
         image_b64 = self.txn_imgs.get("{}".format(image_id).encode('utf-8')).tobytes()
         image_b64 = image_b64.decode(encoding="utf8", errors="ignore")
         image = Image.open(BytesIO(base64.urlsafe_b64decode(image_b64))) # already resized
-        image = self.transform(image)
+        image = self.transform(image)[0]
 
         text = tokenize([_preprocess_text(raw_text)], context_length=self.max_txt_length)[0]
-        eos_index = text.numpy().tolist().index(_tokenizer.vocab['[SEP]'])
-        return image, text, eos_index
+        # eos_index = text.tolist().index(_tokenizer.vocab['[SEP]'])
+        return image, text
 
 
 def pad_dataset(dataset, global_batch_size):
@@ -131,7 +124,7 @@ def fetch_resolution(vision_model):
 
 @dataclass
 class DataInfo:
-    dataloader: DataLoader
+    dataloader: GeneratorDataset
     sampler: DistributedSampler
     dataset: LMDBDataset
     epoch_id: int
@@ -155,7 +148,7 @@ def get_dataset(args, is_train, max_txt_length=64, epoch_id=0):
     # pad the dataset splits using the beginning samples in the LMDB files
     # to make the number of samples enough for a full final global batch
     batch_size = args.batch_size if is_train else args.valid_batch_size
-    global_batch_size = batch_size * torch.distributed.get_world_size()
+    global_batch_size = batch_size * args.world_size
     pad_dataset(dataset, global_batch_size)
 
     num_samples = dataset.dataset_len
@@ -163,16 +156,16 @@ def get_dataset(args, is_train, max_txt_length=64, epoch_id=0):
     # from sequential to shuffled (in a determistic order between experiments and epochs). 
     # This is to avoid there being one text matching multiple images (or vice versa) in a local batch
     # which will affect the correctness of computing the validation in-batch accuracy.
-    sampler = DistributedSampler(dataset, shuffle=True, seed=args.seed)
-    sampler.set_epoch(epoch_id if is_train else 0)
+    sampler = DistributedSampler(args.world_size, args.rank) if args.distributed and is_train else None
+    shuffle = True if is_train and sampler is None else None
 
-    dataloader = DataLoader(
+    dataloader = GeneratorDataset(
         dataset,
-        batch_size=batch_size,
-        pin_memory=False,
-        num_workers=args.num_workers if is_train else args.valid_num_workers,
+        column_names=["images", "texts"],
+        shuffle=shuffle,
+        num_parallel_workers=args.num_workers if is_train else args.valid_num_workers,
         sampler=sampler,
-    )
+    ).batch(batch_size=batch_size, drop_remainder=is_train)
 
     dataloader.num_samples = num_samples
     assert num_samples % dataset.global_batch_size == 0

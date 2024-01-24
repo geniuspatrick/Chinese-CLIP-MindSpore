@@ -271,17 +271,16 @@ class BertEncoder(nn.Cell):
         super(BertEncoder, self).__init__()
         self.output_attentions = config.output_attentions
         self.output_hidden_states = config.output_hidden_states
-        self.num_hidden_layers = config.num_hidden_layers
         self.grad_checkpointing = False
         self.layer = nn.CellList([BertLayer(config) for _ in range(config.num_hidden_layers)])
 
     def construct(self, hidden_states, attention_mask=None, head_mask=None):
         all_hidden_states = ()
         all_attentions = ()
-        for i in range(self.num_hidden_layers):
+        for l in self.layer:
             if self.output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
-            layer_outputs = self.layer[i](hidden_states, attention_mask, None if head_mask is None else head_mask[i])
+            layer_outputs = l(hidden_states, attention_mask, head_mask)
             hidden_states = layer_outputs[0]
 
             if self.output_attentions:
@@ -485,6 +484,7 @@ class BertModel(BertPreTrainedModel):
             head_mask = head_mask.to(dtype=cast_type)  # switch to fload if need + fp16 compatibility
         # else:  we cannot pass tuple of None to Cell in GraphMode
         #     head_mask = [None] * self.config.num_hidden_layers
+        assert head_mask is None, "head_mask is not supported for BertEncoder, cannot specify it for each BertLayer."
 
         embedding_output = self.embeddings(input_ids, position_ids=position_ids, token_type_ids=token_type_ids)
         encoder_outputs = self.encoder(embedding_output, extended_attention_mask, head_mask=head_mask)

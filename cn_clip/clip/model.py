@@ -10,7 +10,7 @@ import numpy as np
 
 import mindspore as ms
 from mindspore import ops, nn, Tensor, Parameter
-from mindspore.ops.function.nn_func import multi_head_attention_forward
+from .layer import multi_head_attention_forward, MultiheadAttention
 
 from . import _tokenizer
 from .configuration_bert import BertConfig
@@ -206,7 +206,7 @@ class ResidualAttentionBlock(nn.Cell):
         super().__init__()
 
         assert use_flash_attention is False
-        self.attn = nn.MultiheadAttention(d_model, n_head)
+        self.attn = MultiheadAttention(d_model, n_head)
         self.ln_1 = LayerNorm(d_model)
         self.mlp = nn.SequentialCell(OrderedDict([
             ("c_fc", nn.Dense(d_model, d_model * 4)),
@@ -293,7 +293,7 @@ class VisualTransformer(nn.Cell):
         x = self.ln_post(x[:, 0, :])
 
         if self.proj is not None:
-            x = x @ self.proj
+            x = x @ self.proj.to(x.dtype)
 
         return x
 
@@ -367,6 +367,7 @@ class CLIP(nn.Cell):
         self.logit_scale = Parameter(ops.ones(()) * np.log(1 / 0.07))
 
         self.tokenizer = tokenizer
+        self.pad_index = self.tokenizer.vocab['[PAD]']  # int: 0
 
         self.initialize_parameters()
 
@@ -391,16 +392,15 @@ class CLIP(nn.Cell):
         self.visual.set_grad_checkpointing(enable)
         self.bert.set_grad_checkpointing(enable)
 
-    def encode_image(self, image, mask_ratio=0):
+    def encode_image(self, image, mask_ratio: float = 0.0):
         return self.visual(image.type(self.visual.conv1.weight.dtype), mask_ratio)
 
     def encode_text(self, text):
-        pad_index = self.tokenizer.vocab['[PAD]']
-        attn_mask = text.ne(pad_index)
+        attn_mask = text.ne(self.pad_index)
         x = self.bert(text, attention_mask=attn_mask)[0]  # [batch_size, seq_length, hidden_size]
-        return x[:, 0, :] @ self.text_projection
+        return x[:, 0, :] @ self.text_projection.to(x.dtype)
 
-    def construct(self, image, text, mask_ratio=0):
+    def construct(self, image, text, mask_ratio: float = 0.0):
         assert image is not None or text is not None, "text and image cannot both be None!"
 
         if image is None:
@@ -446,7 +446,7 @@ def convert_weights(model: nn.Cell):
             if l.bias is not None:
                 l.bias.set_dtype(ms.float16)
 
-        if isinstance(l, nn.MultiheadAttention):
+        if isinstance(l, MultiheadAttention):
             for attr in [*[f"{s}_proj_weight" for s in ["in", "q", "k", "v"]], "in_proj_bias", "bias_k", "bias_v"]:
                 tensor = getattr(l, attr)
                 if tensor is not None:
