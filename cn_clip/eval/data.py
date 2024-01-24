@@ -6,13 +6,12 @@ from pathlib import Path
 from PIL import Image
 import base64
 from io import BytesIO
-import torch
 import lmdb
-from torchvision.transforms import Compose, Resize, ToTensor, Normalize, InterpolationMode
-from torch.utils.data import Dataset, DataLoader, SubsetRandomSampler
-from torch.utils.data.distributed import DistributedSampler
-from torch.utils.data.sampler import SequentialSampler
-import torchvision.datasets as datasets
+
+from mindspore.dataset import SequentialSampler, GeneratorDataset, ImageFolderDataset
+from mindspore.dataset.transforms import Compose
+from mindspore.dataset.vision import Decode, Resize, ToTensor, Normalize, Inter
+
 from cn_clip.clip import tokenize
 
 
@@ -26,7 +25,7 @@ def _preprocess_text(text):
     return text
 
 
-class EvalTxtDataset(Dataset):
+class EvalTxtDataset:
     def __init__(self, jsonl_filename, max_txt_length=24):
         assert os.path.exists(jsonl_filename), "The annotation datafile {} not exists!".format(jsonl_filename)
 
@@ -51,7 +50,7 @@ class EvalTxtDataset(Dataset):
         return text_id, text
 
 
-class EvalImgDataset(Dataset):
+class EvalImgDataset:
     def __init__(self, lmdb_imgs, resolution=224):
         assert os.path.isdir(lmdb_imgs), "The image LMDB directory {} not exists!".format(lmdb_imgs)
 
@@ -67,13 +66,12 @@ class EvalImgDataset(Dataset):
         self.transform = self._build_transform(resolution)
 
     def _build_transform(self, resolution):
-        normalize = Normalize((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711))
         return Compose([
-                Resize((resolution, resolution), interpolation=InterpolationMode.BICUBIC),
-                _convert_to_rgb,
-                ToTensor(),
-                normalize,
-            ])
+            Resize((resolution, resolution), interpolation=Inter.BICUBIC),
+            _convert_to_rgb,
+            ToTensor(),
+            Normalize((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711), is_hwc=False),
+        ])
 
     def __len__(self):
         return self.number_images
@@ -88,16 +86,16 @@ class EvalImgDataset(Dataset):
 
         img_id = int(img_id.decode(encoding="utf8", errors="ignore"))
         image_b64 = image_b64.decode(encoding="utf8", errors="ignore")
-        image = Image.open(BytesIO(base64.urlsafe_b64decode(image_b64))) # already resized
-        image = self.transform(image)
+        image = Image.open(BytesIO(base64.urlsafe_b64decode(image_b64)))  # already resized
+        image = self.transform(image)[0]
 
         return img_id, image
 
 
 @dataclass
 class DataInfo:
-    dataloader: DataLoader
-    sampler: DistributedSampler
+    dataloader: GeneratorDataset
+    sampler: SequentialSampler
 
 
 def get_eval_txt_dataset(args, max_txt_length=24):
@@ -106,16 +104,14 @@ def get_eval_txt_dataset(args, max_txt_length=24):
         input_filename,
         max_txt_length=max_txt_length)
     num_samples = len(dataset)
-    sampler = SequentialSampler(dataset)
+    sampler = SequentialSampler()
 
-    dataloader = DataLoader(
+    dataloader = GeneratorDataset(
         dataset,
-        batch_size=args.text_batch_size,
-        num_workers=0,
-        pin_memory=True,
+        column_names=["text_id", "text"],
+        num_parallel_workers=1,
         sampler=sampler,
-        drop_last=False,
-    )
+    ).batch(batch_size=args.text_batch_size, drop_remainder=False)
     dataloader.num_samples = num_samples
     dataloader.num_batches = len(dataloader)
 
@@ -135,16 +131,14 @@ def get_eval_img_dataset(args):
     dataset = EvalImgDataset(
         lmdb_imgs, resolution=fetch_resolution(args.vision_model))
     num_samples = len(dataset)
-    sampler = SequentialSampler(dataset)
+    sampler = SequentialSampler()
 
-    dataloader = DataLoader(
+    dataloader = GeneratorDataset(
         dataset,
-        batch_size=args.img_batch_size,
-        num_workers=0,
-        pin_memory=True,
+        column_names=["img_id", "image"],
+        num_parallel_workers=1,
         sampler=sampler,
-        drop_last=False,
-    )
+    ).batch(batch_size=args.img_batch_size, drop_remainder=False)
     dataloader.num_samples = num_samples
     dataloader.num_batches = len(dataloader)
 
@@ -152,13 +146,12 @@ def get_eval_img_dataset(args):
 
 
 def get_zeroshot_dataset(args, preprocess_fn):
-    dataset = datasets.ImageFolder(args.datapath, transform=preprocess_fn)
-
-    dataloader = torch.utils.data.DataLoader(
-        dataset,
-        batch_size=args.img_batch_size,
-        num_workers=args.num_workers,
-        sampler=None,
-    )
+    dataloader = ImageFolderDataset(
+        args.datapath,
+        num_parallel_workers=args.num_workers,
+    ).map(
+        operations=[Decode(to_pil=True), preprocess_fn],
+        input_columns="image",
+    ).batch(args.img_batch_size)
 
     return DataInfo(dataloader, None)

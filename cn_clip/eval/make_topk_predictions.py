@@ -7,9 +7,10 @@ import argparse
 import numpy
 from tqdm import tqdm
 import json
-
 import numpy as np
-import torch
+
+import mindspore as ms
+
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -45,6 +46,7 @@ def parse_args():
     )         
     return parser.parse_args()
 
+
 if __name__ == "__main__":
     args = parse_args()
 
@@ -73,10 +75,10 @@ if __name__ == "__main__":
                 text_id = obj['text_id']
                 text_feat = obj['feature']
                 score_tuples = []
-                text_feat_tensor = torch.tensor([text_feat], dtype=torch.float).cuda() # [1, feature_dim]
+                text_feat_tensor = ms.Tensor([text_feat], dtype=ms.float32)  # [1, feature_dim]
                 idx = 0
                 while idx < len(image_ids):
-                    img_feats_tensor = torch.from_numpy(image_feats_array[idx : min(idx + args.eval_batch_size, len(image_ids))]).cuda() # [batch_size, feature_dim]
+                    img_feats_tensor = ms.Tensor(image_feats_array[idx : min(idx + args.eval_batch_size, len(image_ids))])  # [batch_size, feature_dim]
                     batch_scores = text_feat_tensor @ img_feats_tensor.t() # [1, batch_size]
                     for image_id, score in zip(image_ids[idx : min(idx + args.eval_batch_size, len(image_ids))], batch_scores.squeeze(0).tolist()):
                         score_tuples.append((image_id, score))
