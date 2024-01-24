@@ -8,9 +8,9 @@ import argparse
 import logging
 from pathlib import Path
 import json
-
-import torch
 from tqdm import tqdm
+
+import mindspore as ms
 
 from cn_clip.clip.model import convert_weights, CLIP
 from cn_clip.training.main import convert_models_to_fp32
@@ -108,9 +108,6 @@ if __name__ == "__main__":
     for name in sorted(vars(args)):
         val = getattr(args, name)
         print(f"  {name}: {val}")
-    
-    args.gpu = 0
-    torch.cuda.set_device(args.gpu)
 
     # Initialize the model.
     vision_model_config_file = Path(__file__).parent.parent / f"clip/model_configs/{args.vision_model.replace('/', '-')}.json"
@@ -134,7 +131,6 @@ if __name__ == "__main__":
     # See https://discuss.pytorch.org/t/valueerror-attemting-to-unscale-fp16-gradients/81372
     if args.precision == "amp" or args.precision == "fp32":
         convert_models_to_fp32(model)
-    model.cuda(args.gpu)
     if args.precision == "fp16":
         convert_weights(model)
 
@@ -149,17 +145,12 @@ if __name__ == "__main__":
     # Resume from a checkpoint.
     print("Begin to load model checkpoint from {}.".format(args.resume))
     assert os.path.exists(args.resume), "The checkpoint file {} not exists!".format(args.resume)
-    # Map model to be loaded to specified single gpu.
-    loc = "cuda:{}".format(args.gpu)
-    checkpoint = torch.load(args.resume, map_location='cpu')
-    start_epoch = checkpoint["epoch"]
-    sd = checkpoint["state_dict"]
-    if next(iter(sd.items()))[0].startswith('module'):
-        sd = {k[len('module.'):]: v for k, v in sd.items() if "bert.pooler" not in k}
-    model.load_state_dict(sd)
-    print(
-        f"=> loaded checkpoint '{args.resume}' (epoch {checkpoint['epoch']} @ {checkpoint['step']} steps)"
-    )
+    sd = ms.load_checkpoint(args.resume)
+    param_not_load, ckpt_not_load = ms.load_param_into_net(model, sd, strict_load=True)
+    if param_not_load:
+        print(f"{param_not_load} in network is not loaded!")
+    if ckpt_not_load:
+        print(f"{ckpt_not_load} in checkpoint is not loaded!")
 
     # Make inference for texts
     if args.extract_text_feats:
@@ -168,17 +159,16 @@ if __name__ == "__main__":
             args.text_feat_output_path = "{}.txt_feat.jsonl".format(args.text_data[:-6])
         write_cnt = 0
         with open(args.text_feat_output_path, "w") as fout:
-            model.eval()
+            model.set_train(False)
             dataloader = text_data.dataloader
-            with torch.no_grad():
-                for batch in tqdm(dataloader):
-                    text_ids, texts = batch
-                    texts = texts.cuda(args.gpu, non_blocking=True)
-                    text_features = model(None, texts)
-                    text_features /= text_features.norm(dim=-1, keepdim=True)
-                    for text_id, text_feature in zip(text_ids.tolist(), text_features.tolist()):
-                        fout.write("{}\n".format(json.dumps({"text_id": text_id, "feature": text_feature})))
-                        write_cnt += 1
+            for batch in tqdm(dataloader):
+                text_ids, texts = batch
+                text_features = model(None, texts)
+                text_features /= text_features.norm(dim=-1, keepdim=True)
+                for text_id, text_feature in zip(text_ids.tolist(), text_features.tolist()):
+                    fout.write("{}\n".format(json.dumps({"text_id": text_id, "feature": text_feature})))
+                    write_cnt += 1
+                break
         print('{} text features are stored in {}'.format(write_cnt, args.text_feat_output_path))
 
     # Make inference for images
@@ -189,17 +179,16 @@ if __name__ == "__main__":
             args.image_feat_output_path = "{}.img_feat.jsonl".format(args.text_data.replace("_texts.jsonl", "_imgs"))
         write_cnt = 0
         with open(args.image_feat_output_path, "w") as fout:
-            model.eval()
+            model.set_train(False)
             dataloader = img_data.dataloader
-            with torch.no_grad():
-                for batch in tqdm(dataloader):
-                    image_ids, images = batch
-                    images = images.cuda(args.gpu, non_blocking=True)
-                    image_features = model(images, None)
-                    image_features /= image_features.norm(dim=-1, keepdim=True)
-                    for image_id, image_feature in zip(image_ids.tolist(), image_features.tolist()):
-                        fout.write("{}\n".format(json.dumps({"image_id": image_id, "feature": image_feature})))
-                        write_cnt += 1
+            for batch in tqdm(dataloader):
+                image_ids, images = batch
+                image_features = model(images, None)
+                image_features /= image_features.norm(dim=-1, keepdim=True)
+                for image_id, image_feature in zip(image_ids.tolist(), image_features.tolist()):
+                    fout.write("{}\n".format(json.dumps({"image_id": image_id, "feature": image_feature})))
+                    write_cnt += 1
+                break
         print('{} image features are stored in {}'.format(write_cnt, args.image_feat_output_path))
 
     print("Done!")
