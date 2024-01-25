@@ -1,23 +1,29 @@
-from math import ceil
 import os
-import logging
-from pathlib import Path
 import json
-import time
+import random
+import numpy as np
+import logging
+from math import ceil
+from pathlib import Path
 from time import gmtime, strftime
-import importlib.util
 
 import mindspore as ms
-from mindspore import Tensor, nn, ops
+from mindspore import nn
 from mindspore.amp import DynamicLossScaler, StaticLossScaler
 from mindspore.communication import get_group_size, get_local_rank, get_rank, init
 
-from cn_clip.clip.model import convert_weights, convert_state_dict, resize_pos_embed, CLIP
-from cn_clip.training.train import ClipLoss, build_trainer, CallbackForCLIP, evaluate
+from cn_clip.clip.model import convert_weights, resize_pos_embed, CLIP
+from cn_clip.training.train import AdamW, ClipLoss, build_trainer, CallbackForCLIP
 from cn_clip.training.data import get_data
 from cn_clip.training.params import parse_args
 from cn_clip.training.logger import setup_logging
 from cn_clip.training.scheduler import cosine_lr
+
+
+def random_seed(seed=42, rank=0):
+    ms.set_seed(seed + rank)
+    np.random.seed(seed + rank)
+    random.seed(seed + rank)
 
 
 # Used by https://github.com/openai/CLIP/issues/83 but not below.
@@ -56,13 +62,12 @@ def init_distributed_device(args):
 
 def check_args(args):
     """some setting are not supported yet, but will be done in the future"""
-    if args.grad_checkpointing:
-        logging.warning("Gradient checkpointing is not supported. Setting enable is omitted.")
-    if args.use_flash_attention:
-        logging.warning("Flash attention is not supported. Setting enable is omitted.")
-    if args.use_bn_sync:
-        logging.warning("Sync BN is not supported. Setting enable is omitted.")
-    assert args.distllation is False
+    assert args.report_training_batch_acc is False
+    assert args.use_bn_sync is False, "Sync BN is not supported"
+    assert args.grad_checkpointing is False, "Gradient checkpointing is not supported."
+    assert args.use_flash_attention is False, "Flash attention is not supported."
+    assert args.accum_freq == 1, "Accumulation is not supported."
+    assert args.distillation is False
 
 
 def main():
@@ -72,6 +77,7 @@ def main():
     # Set distributed group
     ms.set_context(mode=ms.GRAPH_MODE)
     device = init_distributed_device(args)
+    random_seed(args.seed)
 
     # Set output path
     time_suffix = strftime("%Y-%m-%d-%H-%M-%S", gmtime())
@@ -107,7 +113,7 @@ def main():
     model_info['use_flash_attention'] = args.use_flash_attention
 
     model = CLIP(**model_info)
-    sd = ms.load_checkpoint(args.clip_weight_path)
+    sd = ms.load_checkpoint(args.pretrained_weights_path)
     param_not_load, ckpt_not_load = ms.load_param_into_net(model, sd, strict_load=True)
     if param_not_load:
         print(f"{param_not_load} in network is not loaded!")
@@ -153,14 +159,14 @@ def main():
             args.max_steps = (num_batches // args.accum_freq) * args.max_epochs
         total_steps = args.max_steps
         scheduler = cosine_lr(args.lr, args.warmup, total_steps)
-        optimizer = nn.AdamWeightDecay(
+        optimizer = AdamW(
             [
                 {"params": gain_or_bias_params, "weight_decay": 0.},
                 {"params": rest_params, "weight_decay": args.wd},
+                {"order_params": model.trainable_params()},
             ],
-            learning_rate=scheduler,
-            beta1=args.beta1,
-            beta2=args.beta2,
+            lr=scheduler,
+            betas=(args.beta1, args.beta2),
             eps=args.eps,
         )
 
@@ -174,24 +180,22 @@ def main():
             for name in sorted(vars(args)):
                 val = getattr(args, name)
                 f.write(f"{name}: {val}\n")
-
-    if args.local_rank == 0:
-        for name in sorted(vars(args)):
-            val = getattr(args, name)
-            logging.info(f"  {name}: {val}")
-    logging.info(f"Use device {args.device} for training")
+                logging.info(f"  {name}: {val}")
+        logging.info(f"Use device {args.device} for training")
 
     # Note for mask_ratio
     if is_master(args) and args.mask_ratio > 0 and args.vision_model in ['RN50']:
-        logging.info("Note: mask_ratio > 0 (FLIP strategy) is currently only implemented for VisualTransformer. " + \
-            "It will not function for ResNet backbone.")    
+        logging.info(
+            "Note: mask_ratio > 0 (FLIP strategy) is currently only implemented for VisualTransformer. "
+            "It will not function for ResNet backbone."
+        )
 
     # Optionally resume from a checkpoint
     start_epoch = 0
     steps = 0
     # Automatically restore latest checkpoint if exists
     if args.resume is None:
-        latest_path = os.path.join(args.checkpoint_path, f"epoch_latest.pt")
+        latest_path = os.path.join(args.checkpoint_path, f"epoch_latest.ckpt")
         if os.path.isfile(latest_path):
             args.resume = latest_path
     if args.resume is not None:
@@ -205,9 +209,6 @@ def main():
             sd = {k: v for k, v in checkpoint["state_dict"].items() if "bert.pooler" not in k}
             # Resize the positional embedding by interpolation, if needed
             resize_pos_embed(sd, model, prefix="module.")
-            # Adapt flash attention
-            if args.use_flash_attention:
-                sd = convert_state_dict(sd)
             # Load the state dict
             ms.load_param_into_net(model, sd, strict_load=True)
             # Restore the epoch and steps info, reload the dataset and dataloader for the resume epoch
@@ -236,7 +237,7 @@ def main():
         model, loss, optimizer, amp_level=args.amp_opt_level, scaler=scaler, grad_clip_norm=args.grad_clip_norm
     )
     callbacks = [CallbackForCLIP(args, data, trainer, start_epoch)]
-    trainer.train(args.max_epochs - start_epoch, data["train"].dataloader, callbacks=callbacks, dataset_sink_mode=True)
+    trainer.train(args.max_epochs - start_epoch, data["train"].dataloader, callbacks=callbacks, dataset_sink_mode=False)
 
 
 if __name__ == "__main__":

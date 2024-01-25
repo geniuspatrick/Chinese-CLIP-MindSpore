@@ -14,7 +14,7 @@ from mindspore.dataset.transforms import Compose
 from mindspore.dataset.vision import ToTensor, Normalize, Resize, Inter
 
 from . import _tokenizer
-from .model import CLIP, convert_weights, restore_model
+from .model import CLIP, convert_weights
 
 __all__ = [
     "tokenize",

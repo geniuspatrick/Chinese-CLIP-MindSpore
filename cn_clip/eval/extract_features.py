@@ -88,7 +88,31 @@ def parse_args():
     )    
     args = parser.parse_args()
 
-    return args    
+    return args
+
+
+def load_state_dict(checkpoint_path: str):
+    checkpoint = ms.load_checkpoint(checkpoint_path)
+    state_dict = checkpoint
+    # TODO: We may should do unwrap stuffs like cleaning the augly "_backbone" prefix when saving checkpoints.
+    if "optimizer.global_step" in state_dict:  # need to unwrap trainer-format checkpoint
+        optimizer_state_dict = {}
+        model_state_dict = {}
+        mics_state_dict = {}
+        for k, v in state_dict.items():
+            if k.startswith("optimizer."):
+                k = k[len("optimizer.") :]
+                if k.startswith("adam") or k == "global_step" or "learning_rate" in k:
+                    optimizer_state_dict[k] = v
+                else:
+                    model_state_dict[k] = v
+            elif k.startswith("network."):
+                k = k[len("network.") :]
+                model_state_dict[k.replace("_backbone.", "")] = v
+            else:
+                mics_state_dict[k] = v
+        state_dict = model_state_dict
+    return state_dict
 
 
 if __name__ == "__main__":
@@ -122,8 +146,8 @@ if __name__ == "__main__":
     # Resume from a checkpoint.
     print("Begin to load model checkpoint from {}.".format(args.resume))
     assert os.path.exists(args.resume), "The checkpoint file {} not exists!".format(args.resume)
-    sd = ms.load_checkpoint(args.resume)
-    param_not_load, ckpt_not_load = ms.load_param_into_net(model, sd, strict_load=True)
+    state_dict = load_state_dict(args.resume)
+    param_not_load, ckpt_not_load = ms.load_param_into_net(model, state_dict, strict_load=True)
     if param_not_load:
         print(f"{param_not_load} in network is not loaded!")
     if ckpt_not_load:

@@ -77,15 +77,15 @@ def parse_args():
     parser.add_argument("--beta2", type=float, default=None, help="Adam beta 2.")
     parser.add_argument("--eps", type=float, default=None, help="Adam epsilon.")
     parser.add_argument("--wd", type=float, default=0.2, help="Weight decay.")
+    parser.add_argument("--warmup", type=int, default=500, help="Number of steps to warmup for.")
     parser.add_argument(
-        "--warmup", type=int, default=500, help="Number of steps to warmup for."
-    )
-    parser.add_argument("--use-bn-sync",
+        "--use-bn-sync",
         default=False,
         action="store_true",
         help="Whether to use batch norm sync."
     )
-    parser.add_argument("--use-augment",
+    parser.add_argument(
+        "--use-augment",
         default=False,
         action="store_true",
         help="Whether to use image augment."
@@ -145,13 +145,6 @@ def parse_args():
         help="Random mask ratio of patches during finetuning. Default to zero which does not mask any patches.",
     )
     parser.add_argument(
-        "--clip-weight-path",
-        default=None,
-        type=str,
-        help="The path of pretrained weight, used to initialize the image encoder and text encoder. "
-             "Set to None if you do not use pretrained CLIP",
-    )    
-    parser.add_argument(
         "--freeze-vision",
         action="store_true",
         default=False,
@@ -162,6 +155,12 @@ def parse_args():
         choices=["RoBERTa-wwm-ext-base-chinese", "RoBERTa-wwm-ext-large-chinese", "RBT3-chinese"],
         default="RoBERTa-wwm-ext-base-chinese",
         help="Name of the text backbone to use.",
+    )
+    parser.add_argument(
+        "--pretrained-weights-path",
+        default=None,
+        type=str,
+        help="The path of pretrained weights, used to initialize the image encoder and text encoder."
     )
     parser.add_argument(
         "--grad-checkpointing",
@@ -208,9 +207,9 @@ def parse_args():
         help="Random seed."
     )
     parser.add_argument("--grad-clip-norm", type=float, default=None, help="Gradient clip.")
-    # arguments for distllation
+    # arguments for distillation
     parser.add_argument(
-        "--distllation",
+        "--distillation",
         default=False,
         action="store_true",
         help="If true, more information is logged."

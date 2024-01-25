@@ -8,8 +8,9 @@ import numpy as np
 from tqdm import tqdm
 
 import mindspore as ms
-from mindspore import Tensor, context, nn, ops
+from mindspore import Parameter, Tensor, context, nn, ops
 from mindspore.amp import DynamicLossScaler, LossScaler, StaticLossScaler, all_finite
+from mindspore.nn.optim.optimizer import Optimizer, opt_init_args_register
 from mindspore.train import Callback, Model, save_checkpoint
 from mindspore.train.amp import _OutputTo16, _OutputTo32, custom_mixed_precision, get_black_list, get_white_list
 
@@ -18,6 +19,120 @@ _logger = logging.getLogger(__name__)
 
 def is_master(args):
     return args.rank == 0
+
+
+_adam_opt = ops.MultitypeFuncGraph("adam_opt")
+
+
+@_adam_opt.register(
+    "Tensor", "Tensor", "Tensor", "Tensor", "Tensor", "Tensor", "Tensor", "Tensor", "Tensor", "Tensor", "Tensor", "Bool"
+)
+def adam_opt(beta1, beta2, beta1_power, beta2_power, eps, lr, weight_decay, param, m, v, grad, decay_flag):
+    """
+    Update parameters.
+    Args:
+        beta1 (Tensor): The exponential decay rate for the 1st moment estimations. Should be in range (0.0, 1.0).
+        beta2 (Tensor): The exponential decay rate for the 2nd moment estimations. Should be in range (0.0, 1.0).
+        beta1_power (Tensor): beta1 ** t, where t is the optimization step.
+        beta2_power (Tensor): beta2 ** t, where t is the optimization step.
+        eps (Tensor): Term added to the denominator to improve numerical stability. Should be greater than 0.
+        lr (Tensor): Learning rate.
+        weight_decay (Tensor): Weight decay. Should be equal to or greater than 0.
+        param (Tensor): Parameters.
+        m (Tensor): m value of parameters.
+        v (Tensor): v value of parameters.
+        grad (Tensor): Gradient of parameters.
+        decay_flag (bool): Applies weight decay or not.
+    Returns:
+        Tensor, the new value of parameter after updating.
+    """
+    success = True
+    next_m = ops.mul(beta1, m) + ops.mul(1.0 - beta1, grad)
+    next_v = ops.mul(beta2, v) + ops.mul(1.0 - beta2, ops.square(grad))
+    regulate_m = next_m / (1.0 - beta1_power)
+    regulate_v = next_v / (1.0 - beta2_power)
+
+    update = regulate_m / (eps + ops.sqrt(regulate_v))
+    if decay_flag:
+        update = ops.mul(lr, update + ops.mul(weight_decay, param))
+    else:
+        update = ops.mul(lr, update)
+    next_param = param - ops.reshape(update, ops.shape(param))
+
+    success = ops.depend(success, ops.assign(param, next_param))
+    success = ops.depend(success, ops.assign(m, next_m))
+    success = ops.depend(success, ops.assign(v, next_v))
+    return success
+
+
+class AdamW(Optimizer):
+    @opt_init_args_register
+    def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=1e-2, loss_scale=1.0):
+        super().__init__(lr, params, weight_decay, loss_scale)
+        if not 0.0 <= eps:
+            raise ValueError("Invalid epsilon value: {}".format(eps))
+        if not 0.0 <= betas[0] < 1.0:
+            raise ValueError("Invalid beta parameter at index 0: {}".format(betas[0]))
+        if not 0.0 <= betas[1] < 1.0:
+            raise ValueError("Invalid beta parameter at index 1: {}".format(betas[1]))
+        if not 0.0 <= weight_decay:
+            raise ValueError("Invalid weight_decay value: {}".format(weight_decay))
+        self.beta1 = Tensor(betas[0], ms.float32)
+        self.beta2 = Tensor(betas[1], ms.float32)
+        self.beta1_power = Parameter(Tensor(1.0, dtype=ms.float32), name="beta1_power")
+        self.beta2_power = Parameter(Tensor(1.0, dtype=ms.float32), name="beta2_power")
+        self.eps = Tensor(eps, ms.float32)
+        self.moment1 = self._parameters.clone(prefix="adam_m", init="zeros")
+        self.moment2 = self._parameters.clone(prefix="adam_v", init="zeros")
+        assert self.use_parallel is False, "Parallel optimizer is not supported!"
+
+    def construct(self, grads):
+        grads = self.flatten_gradients(grads)
+        grads = self.scale_grad(grads)
+        lr = self.get_lr()
+        weight_decay = self.get_weight_decay()
+        self.assignadd(self.global_step, self.global_step_increase_tensor)
+
+        params = self._parameters
+        moment1 = self.moment1
+        moment2 = self.moment2
+        beta1_power = self.beta1_power * self.beta1
+        self.beta1_power = beta1_power
+        beta2_power = self.beta2_power * self.beta2
+        self.beta2_power = beta2_power
+
+        if self.is_group:
+            if self.is_group_lr:
+                success = self.hyper_map(
+                    ops.partial(_adam_opt, self.beta1, self.beta2, beta1_power, beta2_power, self.eps),
+                    lr,
+                    weight_decay,
+                    params,
+                    moment1,
+                    moment2,
+                    grads,
+                    self.decay_flags,
+                )
+            else:
+                success = self.hyper_map(
+                    ops.partial(_adam_opt, self.beta1, self.beta2, beta1_power, beta2_power, self.eps, lr),
+                    weight_decay,
+                    params,
+                    moment1,
+                    moment2,
+                    grads,
+                    self.decay_flags,
+                )
+        else:
+            success = self.hyper_map(
+                ops.partial(_adam_opt, self.beta1, self.beta2, beta1_power, beta2_power, self.eps, lr, weight_decay),
+                params,
+                moment1,
+                moment2,
+                grads,
+                self.decay_flags,
+            )
+        return success
 
 
 class AllGather(nn.Cell):
@@ -234,7 +349,6 @@ class CallbackForCLIP(Callback):
         self.epoch_ts = -1.0
         self.num_batches_per_epoch = -1
         self.num_samples_per_epoch = -1
-        self.sample_digits = -1
 
     def _get_network_from_cbp(self, cb_params):
         network = cb_params.train_network if cb_params.mode == "train" else cb_params.eval_network
@@ -285,7 +399,6 @@ class CallbackForCLIP(Callback):
         dataloader = self.data["train"].dataloader
         self.num_batches_per_epoch = dataloader.num_batches // self.args.accum_freq
         self.num_samples_per_epoch = dataloader.num_samples
-        self.sample_digits = math.ceil(math.log(dataloader.num_samples + 1, 10))
 
     def on_train_epoch_end(self, run_context):
         cb_params = run_context.original_args()
@@ -297,8 +410,9 @@ class CallbackForCLIP(Callback):
         train_time = time.time() - self.epoch_ts
 
         val_time = 0
-        if self.args.val_data is not None and self.args.valid_epoch_interval is not None and (completed_epoch % self.args.valid_epoch_interval) == 0:
-            assert "val" in self.data, "Error: Valid dataset has not been built."
+        if "val" in self.data and self.args.valid_epoch_interval and (
+            (completed_epoch % self.args.valid_epoch_interval) == 0 or completed_epoch == self.args.max_epochs
+        ):
             val_time = time.time()
             model = self._get_network_from_cbp(cb_params).network  # TrainStep -> network(backbone, amp-ed)
             if hasattr(model, "_backbone"):  # _OutputTo32 will add a disgusting prefix '_backbone'
@@ -317,7 +431,7 @@ class CallbackForCLIP(Callback):
                 self.args.save_epoch_frequency > 0 and (completed_epoch % self.args.save_epoch_frequency) == 0
             ):
                 t1 = time.time()
-                save_path = os.path.join(self.args.checkpoint_path, f"epoch{completed_epoch}.pt")
+                save_path = os.path.join(self.args.checkpoint_path, f"epoch{completed_epoch}.ckpt")
                 save_checkpoint(  # TrainStep with network(backbone), criterion, optimizer, scaler, ema, accum_grad
                     self._get_network_from_cbp(cb_params),
                     save_path,
@@ -326,7 +440,7 @@ class CallbackForCLIP(Callback):
                 logging.info("Saved checkpoint {} (epoch {} @ {} steps) (writing took {} seconds)".format(save_path, completed_epoch, cur_step, time.time() - t1))
             # Save the latest params
             t1 = time.time()
-            save_path = os.path.join(self.args.checkpoint_path, f"epoch_latest.pt")
+            save_path = os.path.join(self.args.checkpoint_path, f"epoch_latest.ckpt")
             save_checkpoint(self._get_network_from_cbp(cb_params), save_path, append_dict=checkpoint_dict)
             logging.info("Saved checkpoint {} (epoch {} @ {} steps) (writing took {} seconds)".format(save_path, completed_epoch, cur_step, time.time() - t1))
 

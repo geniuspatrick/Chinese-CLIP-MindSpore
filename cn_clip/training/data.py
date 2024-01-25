@@ -13,7 +13,7 @@ import pickle
 
 from mindspore.dataset import DistributedSampler, GeneratorDataset
 from mindspore.dataset.transforms import Compose
-from mindspore.dataset.vision import Resize, ToTensor, Normalize, Inter
+from mindspore.dataset.vision import Resize, ToTensor, Normalize, Inter, RandomResizedCrop, RandomHorizontalFlip, AutoAugment
 
 from cn_clip.clip import tokenize
 
@@ -61,25 +61,37 @@ class LMDBDataset:
         self.transform = self._build_transform(resolution)
 
     def _build_transform(self, resolution):
+        _normalize = Normalize((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711), is_hwc=False)
         if self.split == "train" and self.use_augment:
-            from mindcv import create_transforms
+            from mindcv.data import create_transforms
             transform = create_transforms(
                 image_resize=resolution,
                 scale=(0.9, 1.0),
                 is_training=True,
                 color_jitter=None,
-                auto_augment='original',
+                auto_augment='autoaug',
                 interpolation='bicubic',
                 mean=(0.48145466, 0.4578275, 0.40821073),
                 std=(0.26862954, 0.26130258, 0.27577711),
             )
+            t = transform[0]
+            transform[0] = RandomResizedCrop(t.size, t.scale, t.ratio, t.interpolation)
             transform = Compose(transform[:-3] + [_convert_to_rgb] + transform[-3:])
+            print(transform.transforms)
+            # transform = Compose([
+            #     RandomResizedCrop(size=resolution, scale=(0.9, 1.0), interpolation=Inter.BICUBIC),
+            #     RandomHorizontalFlip(),
+            #     _convert_to_rgb,
+            #     AutoAugment(interpolation=Inter.BICUBIC, fill_value=128),
+            #     ToTensor(),
+            #     _normalize,
+            # ])
         else:
             transform = Compose([
                 Resize((resolution, resolution), interpolation=Inter.BICUBIC),
                 _convert_to_rgb,
                 ToTensor(),
-                Normalize((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711), is_hwc=False),
+                _normalize,
             ])
         return transform
 

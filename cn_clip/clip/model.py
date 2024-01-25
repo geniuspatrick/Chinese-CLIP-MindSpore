@@ -432,11 +432,6 @@ class CLIP(nn.Cell):
         return logits_per_image, logits_per_text
 
 
-def convert_models_to_fp32(model):
-    for p in model.get_parameters():
-        p.set_dtype(ms.float32)
-
-
 def convert_weights(model: nn.Cell):
     """Convert applicable model parameters to fp16"""
 
@@ -463,89 +458,6 @@ def convert_weights(model: nn.Cell):
                     attr.set_dtype(ms.float16)
 
     model.apply(_convert_weights_to_fp16)
-
-
-def restore_model(model, clip_state_dict: dict, bert_state_dict: dict, use_flash_attention: bool):
-    merged_state_dict = {}
-
-    # use clip_state_dict to initialize the image encoder & logit scale
-    if clip_state_dict is not None:
-        for k, v in clip_state_dict.items():
-            if k.startswith("visual") or k == "logit_scale":
-                merged_state_dict[k] = v
-
-    # use bert_state_dict to initialize the text encoder
-    if bert_state_dict is not None:
-        for k, v in bert_state_dict.items():
-            if k.startswith("bert") and "bert.pooler" not in k:
-                merged_state_dict[k] = v
-
-    # adapt flash attention
-    if use_flash_attention:
-        merged_state_dict = convert_state_dict(merged_state_dict)
-
-    convert_weights(model)
-    resize_pos_embed(merged_state_dict, model)
-    model.load_state_dict(merged_state_dict, strict=False)
-    return model.set_train(False)
-
-
-def convert_state_dict(state_dict):
-    """Adapt to Flash Attention"""
-    if not state_dict:
-        return state_dict
-
-    prefix = 'module.' if list(state_dict.keys())[0].startswith('module') else ''
-
-    if f'{prefix}visual.transformer.resblocks.0.attn.in_proj_weight' in state_dict:
-        for k in list(state_dict.keys()):
-            if 'attn.in_proj_weight' in k:
-                state_dict[k.replace('attn.in_proj_weight', 'attn.Wqkv.weight')] = state_dict.pop(k)
-            elif 'attn.in_proj_bias' in k:
-                state_dict[k.replace('attn.in_proj_bias', 'attn.Wqkv.bias')] = state_dict.pop(k)
-    elif f'{prefix}visual.transformer.resblocks.0.attn.Wqkv.weight' in state_dict:
-        for k in list(state_dict.keys()):
-            if 'attn.Wqkv.weight' in k:
-                state_dict[k.replace('attn.Wqkv.weight', 'attn.in_proj_weight')] = state_dict.pop(k)
-            elif 'attn.Wqkv.bias' in k:
-                state_dict[k.replace('attn.Wqkv.bias', 'attn.in_proj_bias')] = state_dict.pop(k)
-
-    if f'{prefix}bert.encoder.layer.0.attention.self.query.weight' in state_dict:
-        i = 0
-        while f'{prefix}bert.encoder.layer.{i}.attention.self.query.weight' in state_dict:
-            state_dict[f'{prefix}bert.encoder.layer.{i}.attention.self.Wqkv.weight'] = ops.cat(
-                (state_dict.pop(f'{prefix}bert.encoder.layer.{i}.attention.self.query.weight'),
-                 state_dict.pop(f'{prefix}bert.encoder.layer.{i}.attention.self.key.weight'),
-                 state_dict.pop(f'{prefix}bert.encoder.layer.{i}.attention.self.value.weight'))
-            )
-            state_dict[f'{prefix}bert.encoder.layer.{i}.attention.self.Wqkv.bias'] = ops.cat(
-                (state_dict.pop(f'{prefix}bert.encoder.layer.{i}.attention.self.query.bias'),
-                 state_dict.pop(f'{prefix}bert.encoder.layer.{i}.attention.self.key.bias'),
-                 state_dict.pop(f'{prefix}bert.encoder.layer.{i}.attention.self.value.bias'))
-            )
-            state_dict[f'{prefix}bert.encoder.layer.{i}.attention.self.out_proj.weight'] = \
-                state_dict.pop(f'{prefix}bert.encoder.layer.{i}.attention.output.dense.weight')
-            state_dict[f'{prefix}bert.encoder.layer.{i}.attention.self.out_proj.bias'] = \
-                state_dict.pop(f'{prefix}bert.encoder.layer.{i}.attention.output.dense.bias')
-            i += 1
-    elif f'{prefix}bert.encoder.layer.0.attention.self.Wqkv.weight' in state_dict:
-        i = 0
-        while f'{prefix}bert.encoder.layer.{i}.attention.self.Wqkv.weight' in state_dict:
-            state_dict[f'{prefix}bert.encoder.layer.{i}.attention.self.query.weight'], \
-            state_dict[f'{prefix}bert.encoder.layer.{i}.attention.self.key.weight'], \
-            state_dict[f'{prefix}bert.encoder.layer.{i}.attention.self.value.weight'] = \
-                ops.chunk(state_dict.pop(f'{prefix}bert.encoder.layer.{i}.attention.self.Wqkv.weight'), chunks=3)
-            state_dict[f'{prefix}bert.encoder.layer.{i}.attention.self.query.bias'], \
-            state_dict[f'{prefix}bert.encoder.layer.{i}.attention.self.key.bias'], \
-            state_dict[f'{prefix}bert.encoder.layer.{i}.attention.self.value.bias'] = \
-                ops.chunk(state_dict.pop(f'{prefix}bert.encoder.layer.{i}.attention.self.Wqkv.bias'), chunks=3)
-            state_dict[f'{prefix}bert.encoder.layer.{i}.attention.output.dense.weight'] = \
-                state_dict.pop(f'{prefix}bert.encoder.layer.{i}.attention.self.out_proj.weight')
-            state_dict[f'{prefix}bert.encoder.layer.{i}.attention.output.dense.bias'] = \
-                state_dict.pop(f'module.bert.encoder.layer.{i}.attention.self.out_proj.bias')
-            i += 1
-
-    return state_dict
 
 
 def resize_pos_embed(state_dict, model, interpolation: str = 'bicubic', seq_dim=1, prefix=""):
